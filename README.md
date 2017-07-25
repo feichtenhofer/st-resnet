@@ -25,7 +25,7 @@ If you use our code/models/data for your research, please cite our papers:
           title={Spatiotemporal multiplier networks for video action recognition},
           author={Feichtenhofer, Christoph and Pinz, Axel and Wildes, Richard P}
           booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
-          year={2018}
+          year={2017}
         }
 
 # Requirements
