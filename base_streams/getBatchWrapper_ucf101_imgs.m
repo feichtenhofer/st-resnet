@@ -1,6 +1,6 @@
 function [ fn ] = getBatchWrapper_ucf101_imgs(opts, numThreads, trainopts)
-
 fn = @(imdb,batch, moreopts) getBatch(imdb,batch,opts,numThreads, trainopts, moreopts) ;
+
 end
 
 % -------------------------------------------------------------------------

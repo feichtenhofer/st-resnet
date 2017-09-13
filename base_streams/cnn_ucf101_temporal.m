@@ -1,13 +1,14 @@
 function cnn_ucf101_temporal(varargin)
 
-if ~isempty(gcp('nocreate')),
+
+addpath('..');
+opts = cnn_setup_environment();
+opts.train.gpus = [ 1 : 4 ]
+run(fullfile(fileparts(mfilename('fullpath')), ...
+ '..', 'matconvnet','matlab', 'vl_setupnn.m')) ;
+if numel(opts.train.gpus) <=1 && ~isempty(gcp('nocreate'))
     delete(gcp)
 end
-
-opts = cnn_setup_environment();
-opts.train.gpus =  1 ;
-% opts.train.gpus = [ 1 : 3 ]
-
 opts.dataSet = 'ucf101'; 
 % opts.dataSet = 'hmdb51'; 
 
@@ -24,7 +25,8 @@ opts.train.numSubBatches = 4 ;
 opts.dropOutRatio = .8; % inserted after fully connected layers
 
 opts.train.epochFactor = 100 ;
-opts.train.learningRate = [ 1e-2*ones(1,1) 1e-3*ones(1, 1) 1e-4*ones(1,1) 1e-5*ones(1,1)]  ;
+% opts.train.learningRate = [ 1e-2*ones(1,20) 1e-3*ones(1, 9) 1e-4*ones(1,5) 1e-5*ones(1,5)]  ;
+opts.train.learningRate = [ 1e-2*ones(1,1) 1e-3*ones(1, 1) 1e-4*ones(1,1) 1e-5*ones(1,1) ]  ;
 
 opts.train.augmentation = 'randCropFlipStretch';
 opts.train.augmentation = 'randCropFlip';
@@ -33,8 +35,11 @@ opts.train.augmentation = 'corners';
 opts.train.augmentation = 'multiScaleRegular';
 
 model = ['res50' opts.train.augmentation '-bs=' num2str(opts.train.batchSize) ...
+  '-sub=' num2str(opts.train.numSubBatches) ...
   '-cheapRsz=' num2str(opts.train.cheapResize), ...
   '-split' num2str(opts.nSplit) '-dr' num2str(opts.dropOutRatio)];
+
+opts.train.numSubBatches =  ceil(opts.train.numSubBatches / max(numel(opts.train.gpus),1));
 
 if  strfind(model, 'vgg16');
   baseModel = 'imagenet-vgg-verydeep-16.mat' ; 
@@ -50,6 +55,18 @@ elseif strfind(model, 'res101');
   baseModel = 'imagenet-resnet-101-dag.mat' ;
 elseif strfind(model, 'res50');
   baseModel = 'imagenet-resnet-50-dag.mat' ;
+elseif strfind(model, 'wrn50')
+  baseModel = 'wrn50-2.mat' ;
+elseif strfind(model, 'resnext50')
+  baseModel = 'resnext50-32x4d.mat' ;
+elseif strfind(model, 'resnext101')
+  baseModel = 'resnext101-64x4d.mat' ; 
+elseif strfind(model, 'resnext101-32x4d')
+  baseModel = 'resnext101-32x4d.mat' ;
+elseif strfind(model, 'inception4')
+  baseModel = 'inception-v4.mat' ;  
+elseif strfind(model, 'incepresv2')
+  baseModel = 'inception-resnet-v2.mat' ;
 else
   error('Unknown model %s', model) ; 
 end
@@ -95,7 +112,12 @@ if isstruct(net.layers)
   if net.meta.normalization.imageSize(3) == 3
       net.meta.normalization.imageSize(3) = 20 ;
       diff =  net.meta.normalization.imageSize(3) - size(net.params(1).value,3);
-      net.params(1).value = padarray(net.params(1).value, [0 0 diff 0], 'symmetric', 'post');
+%       net.params(1).value = padarray(net.params(1).value, [0 0 diff 0], 'symmetric', 'post') ; % temporal HP
+      net.params(1).value = repmat(mean(net.params(1).value,3), [1 1 opts.inputdim(3) 1]) ; % temporal LP
+%       l1_filters = net.params(1).value;
+%       figure; vl_imarraysc(l1_filters(:,:,4:6,:))
+%       std(l1_filters(:))
+%       mean(l1_filters(:))
   end
   % replace 1000-way imagenet classifiers
   for p = 1 : numel(net.params)
@@ -150,7 +172,7 @@ if ~isnan(opts.dropOutRatio)
     if opts.dropOutRatio > 0
       for i=dr_layers, net.layers(i).block.rate = opts.dropOutRatio; end
     else
-      net.removeLayer({net.layers(dr_layers).name});
+      net.removeLayer({net.layers(dr_layers).name}, true);
     end
   else
     if opts.dropOutRatio > 0
@@ -210,7 +232,7 @@ net.addLayer('top5error', ...
              'top5error') ;
            
            
-net.print() ;   
+% net.print() ;   
 net.rebuild() ;
 
 
@@ -222,6 +244,7 @@ net.meta.normalization.rgbVariance = [];
 opts.train.train = find(ismember(imdb.images.set, [1  ])) ;
 opts.train.train = repmat(opts.train.train,1,opts.train.epochFactor);
 opts.train.val = find(ismember(imdb.images.set, [2]) );
+% opts.train.train = opts.train.train(1:256);
 
 opts.train.valmode = '250samples' ;
 % opts.train.valmode = '30samples' ;

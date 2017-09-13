@@ -1,18 +1,20 @@
 function cnn_ucf101_spatial(varargin)
 
-if ~isempty(gcp('nocreate')),
+
+addpath('..');
+opts = cnn_setup_environment();
+opts.train.gpus = [ 4 : 4 ]
+run(fullfile(fileparts(mfilename('fullpath')), ...
+ '..', 'matconvnet','matlab', 'vl_setupnn.m')) ;
+if numel(opts.train.gpus) <=1 && ~isempty(gcp('nocreate'))
     delete(gcp)
 end
-
-opts = cnn_setup_environment();
-opts.train.gpus =  1 ;
-% opts.train.gpus = [ 1 : 3 ]
-
 opts.dataSet = 'ucf101'; 
 % opts.dataSet = 'hmdb51'; 
 
 opts.train.memoryMapFile = fullfile(tempdir, 'ramdisk', ['matconvnet' num2str(feature('getpid')) '.bin']) ;
-addpath('network_surgery');
+
+
 opts.dataDir = fullfile(opts.dataPath, opts.dataSet) ;
 opts.splitDir = [opts.dataSet '_splits']; 
 opts.nSplit = 1 ;
@@ -21,20 +23,23 @@ opts.train.cheapResize = 0 ;
 opts.inputdim  = [ 224,  224, 3] ;
 
 opts.train.batchSize = 256  ;
-opts.train.numSubBatches =  ceil(8 / max(numel(opts.train.gpus),1));
+opts.train.numSubBatches =  8 ;
 
 opts.train.epochFactor = 10 ;
 opts.train.augmentation = 'borders25';
 
-opts.train.backpropDepth =     cell(1, 2);
-opts.train.backpropDepth(:) = {'pool5'};
-opts.train.learningRate =  [1e-2*ones(1, 2) 1e-2*ones(1, 3) 1e-3*ones(1, 3) 1e-4*ones(1, 3)] ;
+% opts.train.backpropDepth =     cell(1, 2);
+% opts.train.backpropDepth(:) = {'pool5'};
+opts.train.learningRate =  [1e-2*ones(1, 2) 1e-3*ones(1, 2) 1e-4*ones(1, 2)] ;
 if strcmp(opts.dataSet, 'hmdb51')
-  opts.train.learningRate =  [1e-2*ones(1, 2) 1e-2*ones(1, 1) 1e-3*ones(1, 1) 1e-4*ones(1, 1)] ;
+  opts.train.learningRate =  [1e-2*ones(1, 2) 1e-3*ones(1, 1) 1e-4*ones(1, 1)] ;
 end
 
 model = ['img-res50-' opts.train.augmentation '-bs=' num2str(opts.train.batchSize) ...
+  '-sub=' num2str(opts.train.numSubBatches) ...
   '-split' num2str(opts.nSplit) '-dr' num2str(opts.dropOutRatio)];
+
+opts.train.numSubBatches =  ceil(opts.train.numSubBatches / max(numel(opts.train.gpus),1));
 
 if  strfind(model, 'vgg16');
   baseModel = 'imagenet-vgg-verydeep-16.mat' ;
@@ -43,15 +48,26 @@ if  strfind(model, 'vgg16');
   opts.train.backpropDepth(:) = {'layer37'};
   opts.train.batchSize = 128  ;
   opts.train.numSubBatches =  ceil(16 / max(numel(opts.train.gpus),1));
-elseif strfind(model, 'vgg-m');
+elseif strfind(model, 'vgg-m')
   baseModel = 'imagenet-vgg-m-2048.mat' ;
-elseif strfind(model, 'res152');
+elseif strfind(model, 'res152')
   baseModel = 'imagenet-resnet-152-dag.mat' ;
-elseif strfind(model, 'res101');
+elseif strfind(model, 'res101')
   baseModel = 'imagenet-resnet-101-dag.mat' ;
-elseif strfind(model, 'res50');
+elseif strfind(model, 'res50')
   baseModel = 'imagenet-resnet-50-dag.mat' ;
-  opts.train.numSubBatches =  ceil(32 / max(numel(opts.train.gpus),1));
+elseif strfind(model, 'wrn50')
+  baseModel = 'wrn50-2.mat' ;
+elseif strfind(model, 'resnext50')
+  baseModel = 'resnext50-32x4d.mat' ;
+elseif strfind(model, 'resnext101')
+  baseModel = 'resnext101-64x4d.mat' ; 
+elseif strfind(model, 'resnext101-32x4d')
+  baseModel = 'resnext101-32x4d.mat' ;
+elseif strfind(model, 'inception4')
+  baseModel = 'inception-v4.mat' ;  
+elseif strfind(model, 'incepresv2')
+  baseModel = 'inception-resnet-v2.mat' ;
 else
   error('Unknown model %s', model) ; 
 end
@@ -142,7 +158,7 @@ if ~isnan(opts.dropOutRatio)
     if opts.dropOutRatio > 0
       for i=dr_layers, net.layers(i).block.rate = opts.dropOutRatio; end
     else
-      net.removeLayer({net.layers(dr_layers).name});
+      net.removeLayer({net.layers(dr_layers).name}, true);
     end
   else
     if opts.dropOutRatio > 0
@@ -202,16 +218,17 @@ net.addLayer('top5error', ...
              net.layers(lossLayers(end)).inputs, ...
              'top5error') ;
            
-net.print() ;   
+% net.print({'input', net.meta.normalization.imageSize}, 'all', true ) 
 net.rebuild() ;
 
-net.meta.normalization.rgbVariance = [];
+net.meta.normalization.rgbVariance = []; 
 
 opts.train.train = find(ismember(imdb.images.set, [1])) ;
 opts.train.train = repmat(opts.train.train,1,opts.train.epochFactor);
-opts.train.valmode = '250samples';
-% opts.train.valmode = '30samples'
 
+% opts.train.valmode = '250samples';
+opts.train.valmode = 'centreSamplesFast'
+% opts.train.train = NaN ; 
 opts.train.denseEval = 1;
 net.conserveMemory = 1 ;
 fn = getBatchWrapper_ucf101_imgs(net.meta.normalization, opts.numFetchThreads, opts.train) ;

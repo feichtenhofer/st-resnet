@@ -26,7 +26,7 @@ opts.nFrames = [];
 opts.subMedian = false;
 opts.stretchAspect = 4/3 ;
 opts.stretchScale = 1.2 ;
-opts.fetchGPU = false ; 
+opts.fetchGPU = true ; 
 [opts, varargin] = vl_argparse(opts, varargin);
 
 flowDir = opts.flowDir;

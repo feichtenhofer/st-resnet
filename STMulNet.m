@@ -1,14 +1,15 @@
 function STMulNet(varargin)
 
 
-opts.train.gpus = [ 1 ];
+opts.train.gpus = [ 1 : 4];
+addpath('..')
+run(fullfile(fileparts(mfilename('fullpath')), ...
+ 'matconvnet','matlab', 'vl_setupnn.m')) ;
 
 opts = cnn_setup_environment(opts);
 
-% opts.dataSet = 'ucf101'; opts.dropOutRatio = 0.8 ;
-opts.dataSet = 'hmdb51'; opts.dropOutRatio = 0.8;
-
-addpath('network_surgery');
+opts.dataSet = 'ucf101'; opts.dropOutRatio = 0.8 ;
+% opts.dataSet = 'hmdb51'; opts.dropOutRatio = 0.8;
 
 opts.dataDir = fullfile(opts.dataPath, opts.dataSet) ;
 opts.splitDir = [opts.dataSet '_splits']; 
@@ -23,7 +24,6 @@ backpropFuseFrom = 1 ;
 opts.nSplit = 1 ;
 addConv3D = 9; % inject temporal convolutions
 addPool3D  = 2 ; % 1 = avg; 2 = max; 3 = tmul 
-addLSTM = 0 ;
 doSum = 0 ;
 doScale = 0 ;
 doMul = 1 ;
@@ -35,16 +35,16 @@ injectDropout = 0;
 opts.train.learningRate =  1*[ 1e-3*ones(1,2) 1e-4*ones(1,1)  1e-5*ones(1,1) 1e-6*ones(1,1)]  ;
 opts.train.augmentation = 'multiScaleRegular';
 opts.train.augmentation = 'f25noCtr';
-opts.train.epochFactor = 10;
+opts.train.epochFactor = 5 ;
 opts.train.batchSize = 128  ;
 opts.train.numSubBatches = 32 ;
 opts.train.cheapResize = 0 ;
 opts.train.fusionLayer = {'res2a_relu', 'res2a'; 'res3a_relu', 'res3a'; 'res4a_relu', 'res4a'; ...
   'res5a_relu', 'res5a'; };
-spacetime_loss = 1 ;
+spacetime_loss = 0 ;
 
 
-model = ['ST-MulNet-' [opts.train.fusionLayer{2,1}] 'oldmodl-img50-flow152-split=' num2str(opts.nSplit) '-dobiDir-' num2str(doBiDirectional) '-3D=' num2str(addConv3D) ...
+model = ['ST-MulNetmcn2_epFact5-' [opts.train.fusionLayer{2,1}] '-img50-flow50-split=' num2str(opts.nSplit) '-dobiDir-' num2str(doBiDirectional) '-3D=' num2str(addConv3D) ...
      opts.train.augmentation '-bs=' num2str(opts.train.batchSize) ...
     '-sub=' num2str(opts.train.numSubBatches) ...
     '-cheapRsz=' num2str(opts.train.cheapResize), ...
@@ -69,7 +69,6 @@ end
 
 opts.train.numSubBatches =  ceil(opts.train.numSubBatches / max(numel(opts.train.gpus),1));
 
-opts.train.memoryMapFile = fullfile(tempdir, 'ramdisk', ['matconvnet' num2str(opts.nSplit ) '.bin']) ;
 opts.modelA = fullfile(opts.modelPath, [opts.dataSet '-img-resnet50-split' num2str(opts.nSplit) '-dr0.mat']) ;
 opts.modelB = fullfile(opts.modelPath, [opts.dataSet '-flow-resnet50-split' num2str(opts.nSplit) '-dr0.8.mat']) ;
 if strfind(model, 'img152')
@@ -288,7 +287,10 @@ for s=1:nFuse
           '_' opts.train.fuseInto])).outputs];
       net.addLayerAt(i_fusion(end), name, block, ...
                  inputVars, ...
-                  name) ;      
+                  name) ;
+      %       % next line is important for ReLUshortcut          
+      net.layers(cellfun(@(x) any(isequal(x,net.getVarIndex(inputVars(end)))), {net.layers.inputIndexes} )).block.useShortCircuit = 0;
+
     else
       name = [net.layers(i_fusion(end)).name '_concat'];
       block = dagnn.Concat() ;
@@ -541,6 +543,8 @@ opts.train.train = find(ismember(imdb.images.set, [1])) ;
 opts.train.train = repmat(opts.train.train,1,opts.train.epochFactor);
 
 % opts.train.train = NaN;
+% opts.train.train = opts.train.train(1:512);
+
 opts.train.denseEval = 1;
 
 %%
@@ -667,4 +671,4 @@ if injectDropout
 end
 net.conserveMemory = 1 ;
 fn = getBatchWrapper_rgbflow(net.meta.normalization, opts.numFetchThreads, opts.train) ;
-[info] = cnn_train_dag(net, imdb, fn, opts.train) ;
+[info] = cnn_train_dag_mcn2(net, imdb, fn, opts.train) ;

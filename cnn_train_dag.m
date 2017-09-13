@@ -1,4 +1,4 @@
-function [net,stats] = cnn_train_dag(net, imdb, getBatch, varargin)
+function [net,stats] = cnn_train_dag_mcn2(net, imdb, getBatch, varargin)
 %CNN_TRAIN_DAG Demonstrates training a CNN using the DagNN wrapper
 %    CNN_TRAIN_DAG() is similar to CNN_TRAIN(), but works with
 %    the DagNN wrapper instead of the SimpleNN wrapper.
@@ -8,6 +8,7 @@ function [net,stats] = cnn_train_dag(net, imdb, getBatch, varargin)
 %
 % This file is part of the VLFeat library and is made available under
 % the terms of the BSD license (see the COPYING file).
+addpath(fullfile(vl_rootnn, 'examples'));
 
 opts.expDir = fullfile('data','exp') ;
 opts.continue = true ;
@@ -17,28 +18,37 @@ opts.train = [] ;
 opts.val = [] ;
 opts.gpus = [] ;
 opts.prefetch = false ;
+opts.epochSize = inf;
 opts.numEpochs = 300 ;
 opts.learningRate = 0.001 ;
 opts.weightDecay = 0.0005 ;
+
+opts.solver = [] ;  % Empty array means use the default SGD solver
+[opts, varargin] = vl_argparse(opts, varargin) ;
+if ~isempty(opts.solver)
+  assert(isa(opts.solver, 'function_handle') && nargout(opts.solver) == 2,...
+    'Invalid solver; expected a function handle with two outputs.') ;
+  % Call without input arguments, to get default options
+  opts.solverOpts = opts.solver() ;
+end
+
 opts.momentum = 0.9 ;
-opts.saveMomentum = true ;
+opts.saveSolverState = true ;
 opts.nesterovUpdate = false ;
 opts.randomSeed = 0 ;
 opts.profile = false ;
-opts.parameterServer.method = 'mmap'; %'tmove' ;
+
+opts.parameterServer.method = 'tmove'; %'tmove' or 'mmap';
 opts.parameterServer.prefix = ['matconvnet' num2str(feature('getpid'))] ;
+opts.parameterServer.memoryMapFile = fullfile(tempdir, 'ramdisk', opts.parameterServer.prefix) ;
 
 opts.derOutputs = {'objective', 1} ;
 opts.extractStatsFn = @extractStats ;
 opts.plotStatistics = true;
+opts.postEpochFn = [] ;  % postEpochFn(net,params,state) called after each epoch; can return a new learning rate, 0 to stop, [] for no change
 
-opts.profile = false ;
-opts.startEpoch = 1;
-opts.epochStep = 1;
-opts.resetLRandWD = false;
 opts.valmode = '30samples';
 opts.temporalStride = 1;
-opts.DropOutRatio = NaN;
 opts.backpropDepth = [];
 opts.numValFrames = 3;
 opts.nFramesPerVid = 5;
@@ -47,18 +57,18 @@ opts.denseEval = 0;
 opts.cudnnWorkspaceLimit = [];
 opts.plotDiagnostics = false;
 opts.augmentation = '';
-opts.plotStatistics = true;
 opts.temporalFullConvTest = true;
-opts.LSTMinit = false;
-opts.temporalPoolAllTest =false;
-opts.visualizeCAM = false;
 [opts, varargin] = vl_argparse(opts, varargin) ;
 
 if ~exist(opts.expDir, 'dir'), mkdir(opts.expDir) ; end
 if isempty(opts.train), opts.train = find(imdb.images.set==1) ; end
 if isempty(opts.val), opts.val = find(imdb.images.set==2) ; end
-if isnan(opts.train), opts.train = [] ; end
-if isnan(opts.val), opts.val = [] ; end
+if isscalar(opts.train) && isnumeric(opts.train) && isnan(opts.train)
+  opts.train = [] ;
+end
+if isscalar(opts.val) && isnumeric(opts.val) && isnan(opts.val)
+  opts.val = [] ;
+end
 
 % -------------------------------------------------------------------------
 %                                                            Initialization
@@ -100,10 +110,10 @@ for epoch=start+1:opts.numEpochs
   params.epoch = epoch ;
   params.learningRate = opts.learningRate(min(epoch, numel(opts.learningRate))) ;
   params.train = opts.train(randperm(numel(opts.train))) ; % shuffle
+  params.train = params.train(1:min(opts.epochSize, numel(opts.train)));
   params.val = opts.val ;
   params.imdb = imdb ;
   params.getBatch = getBatch ;
-
   if iscell(opts.backpropDepth)
     if epoch <= numel(opts.backpropDepth)
       params.backpropDepth = opts.backpropDepth{epoch};
@@ -113,8 +123,7 @@ for epoch=start+1:opts.numEpochs
   else
     params.backpropDepth = opts.backpropDepth;
   end
-%   params.parameterServer.
-
+  
   if numel(opts.gpus) <= 1
     [net, state] = processEpoch(net, state, params, 'train') ;
     [net, state] = processEpoch(net, state, params, 'val') ;
@@ -123,6 +132,7 @@ for epoch=start+1:opts.numEpochs
     end
     lastStats = state.stats ;
   else
+    assert(isempty(params.backpropDepth), 'Cannot use backpropDepth in multi GPU mode.')
     spmd
       [net, state] = processEpoch(net, state, params, 'train') ;
       [net, state] = processEpoch(net, state, params, 'val') ;
@@ -134,14 +144,8 @@ for epoch=start+1:opts.numEpochs
     lastStats = accumulateStats(lastStats) ;
   end
 
-%   if epoch == 1
-    stats.train(epoch) = lastStats.train  ;
-    stats.val(epoch) =  lastStats.val  ;
-%   else
-%     stats.train(epoch) = softAssignStruct(stats, lastStats, 'train')  ;
-%     stats.val(epoch) = softAssignStruct(stats, lastStats, 'val')  ;
-%   end
- 
+  stats.train(epoch) = lastStats.train ;
+  stats.val(epoch) = lastStats.val ;
   clear lastStats ;
   saveStats(modelPath(epoch), stats, opts) ;
 
@@ -176,9 +180,17 @@ for epoch=start+1:opts.numEpochs
       drawnow ;
       print(1, modelFigPath, '-dpdf') ;
     end
+  end  
+  
+  if ~isempty(opts.postEpochFn)
+    if nargout(opts.postEpochFn) == 0
+      opts.postEpochFn(net, params, state) ;
+    else
+      lr = opts.postEpochFn(net, params, state) ;
+      if ~isempty(lr), opts.learningRate = lr; end
+      if opts.learningRate == 0, break; end
+    end
   end
-  
-  
 end
 
 % With multiple GPUs, return one copy
@@ -192,15 +204,24 @@ function [net, state] = processEpoch(net, state, params, mode)
 % spmd caller.
 
 % initialize with momentum 0
-if isempty(state) || isempty(state.momentum)
-  state.momentum = num2cell(zeros(1, numel(net.params))) ;
+if isfield(state, 'momentum'), state.solverState = state.momentum; state.momentum = []; end
+if isempty(state) || isempty(state.solverState)
+  state.solverState = cell(1, numel(net.params)) ;
+  state.solverState(:) = {0} ;
 end
 
 % move CNN  to GPU as needed
 numGpus = numel(params.gpus) ;
 if numGpus >= 1
   net.move('gpu') ;
-  state.momentum = cellfun(@gpuArray, state.momentum, 'uniformoutput', false) ;
+  for i = 1:numel(state.solverState)
+    s = state.solverState{i} ;
+    if isnumeric(s)
+      state.solverState{i} = gpuArray(s) ;
+    elseif isstruct(s)
+      state.solverState{i} = structfun(@gpuArray, s, 'UniformOutput', false) ;
+    end
+  end
 end
 if numGpus > 1
   parserv = ParameterServer(params.parameterServer) ;
@@ -224,6 +245,7 @@ num = 0 ;
 epoch = params.epoch ;
 subset = params.(mode) ;
 adjustTime = 0 ;
+moreopts = [];
 
 stats.num = 0 ; % return something even if subset = []
 stats.time = 0 ;
@@ -244,29 +266,19 @@ if ~strcmp(mode,'train')
 
   moreopts.frameSample = 'uniformly';
   moreopts.augmentation = 'uniform';
+  moreopts.keepFramesDim = true; % make getBatch output 5 dimensional 
+
   if strcmp(params.valmode,'30samples')
     % sample less frames and crops:
     moreopts.numAugments = 6;
     moreopts.nFramesPerVid = 5;
-    params.batchSize =  64*numlabs ;
-    params.numSubBatches =  1;%;  params.batchSize ;
-    moreopts.keepFramesDim = true;
   elseif strcmp(params.valmode,'centreSamplesFast')
     % sample less frames and crops:
     moreopts.numAugments = 2;
     moreopts.nFramesPerVid = 3;
-    params.batchSize =  32*numlabs ;
-    moreopts.keepFramesDim = true;
-    params.numSubBatches = 32;
   elseif strcmp(params.valmode,'250samples') , 
     moreopts.numAugments = 10;
     moreopts.nFramesPerVid = 25;
-    params.batchSize =  16*numlabs ;
-    params.numSubBatches = 1;
-%     g =   gpuDevice(); 
-%     g.AvailableMemory
-%     net.print({'input',[net.meta.normalization.imageSize 1]});  
-    moreopts.keepFramesDim = true; % make getBatch output 5 dimensional    
   elseif strcmp(params.valmode,'dense')
     moreopts.augmentation = 'none';
     moreopts.numAugments = 0;
@@ -274,37 +286,22 @@ if ~strcmp(mode,'train')
     moreopts.keepFramesDim = true; 
     params.batchSize = numlabs;
     params.numSubBatches = numlabs;
-  elseif strcmp(params.valmode,'temporalStrideRandom') , 
-    if params.denseEval % g.AvailableMemory > 9e9
-      moreopts.augmentation = 'none';
-      moreopts.numAugments = 2;
-    else
-      moreopts.numAugments = 2;
-%       if params.numValFrames >= 25, moreopts.numAugments = 10; end;
-    end
-    if params.temporalFullConvTest && ~params.LSTMinit
-      params.nFramesPerVid = params.numValFrames; % new; fully temporal convolutional
-    end
-    if params.temporalPoolAllTest 
-        pool_layers = find(arrayfun(@(x) isa(x.block,'dagnn.PoolTime'), net.layers)) ;
-        for l=pool_layers, net.layers(l).block.poolSize(2) = params.numValFrames; end
-    end
+  elseif strcmp(params.valmode,'temporalStrideRandom')
     moreopts.nFrameStack = params.nFramesPerVid; 
-%     moreopts.frameSample = 'temporalStride';
     moreopts.temporalStride = ceil(median(params.temporalStride));
     moreopts.temporalStride = max(params.temporalStride);
     params.batchSize =  32*numlabs ;
     params.numSubBatches = params.batchSize; % has to be
     moreopts.nFramesPerVid = params.numValFrames;
-    moreopts.keepFramesDim = true; % make getBatch output 5 dimensional 
-
   end
   
   if params.denseEval 
     moreopts.augmentation = 'none';
     moreopts.numAugments = 2;
   end
-
+  if params.temporalFullConvTest
+    params.nFramesPerVid = params.numValFrames;
+  end
   pred_layers = [];
   for l=1:numel(net.layers)
     if isempty( net.layers(l).params ), continue; end;
@@ -331,7 +328,7 @@ end
 start = tic ;
 for t=1:params.batchSize:numel(subset)
   fprintf('%s: epoch %02d: %3d/%3d:', mode, epoch, ...
-          fix((t-1)/params.batchSize)+1, ceil(numel(subset)/params.batchSize));
+          fix((t-1)/params.batchSize)+1, ceil(numel(subset)/params.batchSize)) ;
   batchSize = min(params.batchSize, numel(subset) - t + 1) ;
 
   for s=1:params.numSubBatches
@@ -341,7 +338,6 @@ for t=1:params.batchSize:numel(subset)
     batch = subset(batchStart : params.numSubBatches * numlabs : batchEnd) ;
     num = num + numel(batch) ;
     if numel(batch) == 0, continue ; end
-    clear inputs;
 
     inputs = params.getBatch(params.imdb, batch, moreopts) ;
 
@@ -361,22 +357,6 @@ for t=1:params.batchSize:numel(subset)
     net.meta.curBatchSize = numel(batch);
     inputs{end+1} = 'inputSet'; inputs{end+1} = ceil(params.imdb.images.set(batch)/2); % dataset
 
-    derOutputs = params.derOutputs;
-
-    if params.LSTMinit
-      % initial hidden and cell states:
-      inputs{end+1} = 'h_1';
-      inputs{end+1} = zeros(1,1,4096,numel(batch),'like', inputs{2});
-      inputs{end+1} = 'c_1';
-      inputs{end+1} = zeros(1,1,4096,numel(batch),'like', inputs{2});
-
-      derOutputs{end+1} = sprintf('hn_%d',  params.nFramesPerVid);
-      derOutputs{end+1} = zeros(1,1,4096,numel(batch),'like', inputs{2});
-      derOutputs{end+1} = sprintf('cn_%d',  params.nFramesPerVid);
-      derOutputs{end+1} = zeros(1,1,4096,numel(batch),'like', inputs{2});
-    end
-
-    
     if params.prefetch
       if s == params.numSubBatches
         batchStartNext = t + (labindex-1) + params.batchSize ;
@@ -391,7 +371,6 @@ for t=1:params.batchSize:numel(subset)
         moreopts.frameList = NaN ;
       end
     end
-    
     if ndims(inputs{2})>4  % average over frames
       dataset = inputs{end}(1);
       nClasses = numel(params.imdb.classes.name);
@@ -405,30 +384,18 @@ for t=1:params.batchSize:numel(subset)
       for fr = 1:size(inputs{2},5)
         frame_inputs = inputs; 
         net.meta.curNumFrames = repmat(size(inputs{2},4) / numel(inputs{4}),1,numel(net.layers)); % nFrames = instances/labels
-
         for i = 2:4:numel(inputs)
           if size(frame_inputs{i},5) > 1
             frame_inputs{i}=frame_inputs{i}(:,:,:,:,fr);
           end
         end
-        
         if strcmp(mode, 'train')
           net.accumulateParamDers = (s ~= 1) ;
           net.eval(frame_inputs, derOutputs) ;
         else
           net.eval(frame_inputs) ;
         end   
-
-          [frame_predictions{:,fr}] = deal(net.vars(pred_layers).value) ;
-
-        
-      end
-      if  net.visualize
-          imflow = cellfun(@gather, inputs(fliplr(2:4:numel(inputs))),'UniformOutput',false);
-          imflow = (cat(3,imflow{:}));
-
-          visualizeRgbFlow( imflow, batch,   params.imdb,  frame_predictions, ...
-               net.meta.normalization );
+        [frame_predictions{:,fr}] = deal(net.vars(pred_layers).value) ;
       end
       
       
@@ -445,34 +412,27 @@ for t=1:params.batchSize:numel(subset)
       if min(net.meta.curNumFrames) > 1
         frame_predictions = mean(frame_predictions,4);
       end
-
       if  params.saveAllPredScores
         stats2.allScores(:,:,:,batchStart : params.numSubBatches * numlabs : batchEnd) = gather(frame_predictions);
       end
-        % now average over time (dim+1) and spatial locations and batches
+      % average over time (dim+1) and spatial locations and batches
       frame_predictions = mean(mean(mean(frame_predictions),1),2);
-
-
       [err1, err5] = error_multiclass(params, inputs{4}, gather(frame_predictions));
       stats2.err1 = (stats2.err1 + err1);
       stats2.err5 = (stats2.err5 + err5);
-
-    else
+    else  % inputs four dimensional  
       if strcmp(mode, 'train')
         net.mode = 'normal' ;
         net.accumulateParamDers = (s ~= 1) ;
-        net.eval(inputs, derOutputs, 'holdOn', s < params.numSubBatches) ;
+        net.eval(inputs, params.derOutputs, 'holdOn', s < params.numSubBatches) ;
       else
         net.mode = 'test' ;
         net.eval(inputs) ;
       end
     end
-    
     if strcmp(mode, 'val') && ndims(inputs{2})>4 
       stats2.scores(:, batchStart : params.numSubBatches * numlabs : batchEnd) = squeeze(gather(frame_predictions));
     end
-  
-    
   end
 
   % Accumulate gradient.
@@ -484,15 +444,9 @@ for t=1:params.batchSize:numel(subset)
   % Get statistics.
   time = toc(start) + adjustTime ;
   batchTime = time - stats.time ;
-
-
-%   [net.vars.value] = deal([]) ;
-%   [net.vars.der] = deal([]) ; 
-  
   stats.num = num ;
   stats.time = time ;
   stats = params.extractStatsFn(stats,net) ;
-  
   if ndims(inputs{2})>4  % average over frames
     for f = fieldnames(stats2)'
         f = char(f) ;  stats.(f) = stats2.(f);
@@ -517,14 +471,13 @@ for t=1:params.batchSize:numel(subset)
   end
   fprintf('\n') ;
   
-    % debug info
+  %  debug info
   if params.plotDiagnostics && numGpus <= 1
-    figure(3) ; vl_dagnn_diagnose(net) ; drawnow ;
-%     figure(2) ; net.diagnose('Vars',1,'Params',1,'Time',1) ; drawnow ;
+    figure(2) ; net.diagnose('Vars',1,'Params',1,'Time',1) ; drawnow ;
   end
 end
 
-% Save back to params.
+% Save back to state.
 state.stats.(mode) = stats ;
 if params.profile
   if numGpus <= 1
@@ -535,10 +488,17 @@ if params.profile
     mpiprofile off ;
   end
 end
-if ~params.saveMomentum
-  state.momentum = [] ;
+if ~params.saveSolverState
+  state.solverState = [] ;
 else
-  state.momentum = cellfun(@gather, state.momentum, 'uniformoutput', false) ;
+  for i = 1:numel(state.solverState)
+    s = state.solverState{i} ;
+    if isnumeric(s)
+      state.solverState{i} = gather(s) ;
+    elseif isstruct(s)
+      state.solverState{i} = structfun(@gather, s, 'UniformOutput', false) ;
+    end
+  end
 end
 
 net.reset() ;
@@ -551,15 +511,16 @@ numGpus = numel(params.gpus) ;
 otherGpus = setdiff(1:numGpus, labindex) ;
 
 for p=1:numel(net.params)
-  if isempty(net.params(p).der), continue; end
+
   if ~isempty(parserv)
     parDer = parserv.pullWithIndex(p) ;
   else
     parDer = net.params(p).der ;
   end
-  
-  
-
+  if isempty(parDer)
+    % fprintf('empty param for: %s\n', net.params(p).name) ;
+    continue;
+  end
   switch net.params(p).trainMethod
 
     case 'average' % mainly for batch normalization
@@ -577,23 +538,30 @@ for p=1:numel(net.params)
         parDer = vl_taccum(1/batchSize, parDer, ...
                            thisDecay, net.params(p).value) ;
 
-        % Update momentum.
-        state.momentum{p} = vl_taccum(...
-          params.momentum, state.momentum{p}, ...
-          -1, parDer) ;
-
-        % Nesterov update (aka one step ahead).
-        if params.nesterovUpdate
-          delta = vl_taccum(...
-            params.momentum, state.momentum{p}, ...
+        if isempty(params.solver)
+          % Default solver is the optimised SGD.
+          % Update momentum.
+          state.solverState{p} = vl_taccum(...
+            params.momentum, state.solverState{p}, ...
             -1, parDer) ;
-        else
-          delta = state.momentum{p} ;
-        end
 
-        % Update parameters.
-        net.params(p).value = vl_taccum(...
-          1,  net.params(p).value, thisLR, delta) ;
+          % Nesterov update (aka one step ahead).
+          if params.nesterovUpdate
+            delta = params.momentum * state.solverState{p} - parDer ;
+          else
+            delta = state.solverState{p} ;
+          end
+
+          % Update parameters.
+          net.params(p).value = vl_taccum(...
+            1,  net.params(p).value, thisLR, delta) ;
+
+        else
+          % call solver function to update weights
+          [net.params(p).value, state.solverState{p}] = ...
+            params.solver(net.params(p).value, state.solverState{p}, ...
+            parDer, params.solverOpts, thisLR) ;
+        end
       end
     otherwise
       error('Unknown training method ''%s'' for parameter ''%s''.', ...
@@ -640,6 +608,7 @@ function stats = extractStats(stats, net)
 % -------------------------------------------------------------------------
 sel = find(cellfun(@(x) isa(x,'dagnn.Loss')||isa(x,'dagnn.Loss'), {net.layers.block})) ;
 for i = 1:numel(sel)
+  if net.layers(sel(i)).block.ignoreAverage, continue; end
   stats.(net.layers(sel(i)).name) = net.layers(sel(i)).block.average ;
 end
 
@@ -726,7 +695,6 @@ if numGpus >= 1 && cold
       gpuDevice(opts.gpus(labindex))
     end
   end
-  vl_setupnn;
 end
 
 function [err1, err5] = error_multiclass(opts, labels, predictions)
@@ -735,9 +703,3 @@ function [err1, err5] = error_multiclass(opts, labels, predictions)
 error = ~bsxfun(@eq, predictions, reshape(labels, 1, 1, 1, [])) ;
 err1 = sum(sum(sum(error(:,:,1,:)))) ;
 err5 = sum(sum(sum(min(error(:,:,1:5,:),[],3)))) ;
-
-function s1 = softAssignStruct(s1, s2, i)
-for f = fieldnames(s2)'
-  f = char(f) ;
-  s1(i).(f) = s2.(f);
-end
